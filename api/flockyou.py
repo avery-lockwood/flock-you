@@ -29,6 +29,11 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', logge
 from flockyou_ble import bp as flock_ble_bp, init_bridge as flock_ble_init_bridge
 app.register_blueprint(flock_ble_bp)
 
+# Phone companion sync (Android app / web logger): GPS track + geotagged
+# detection/mark events POSTed from the phone, stored as JSONL + GPX export.
+from companion import bp as companion_bp
+app.register_blueprint(companion_bp)
+
 # Global variables
 detections = []
 cumulative_detections = []
