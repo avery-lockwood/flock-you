@@ -8,3 +8,5 @@
 .claude/
 api/data/
 api/exports/
+__pycache__/
+api/companion_data/

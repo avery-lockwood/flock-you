@@ -6,6 +6,7 @@
 #include <SPIFFS.h>
 #include <Preferences.h>
 #include "display_dongle.h"
+#include "ble_companion.h"
 
 // ============================================================
 // CONFIG  (board defaults; override via platformio build_flags)
@@ -22,6 +23,25 @@
 #define APA102_FLASH_G     0
 #define APA102_FLASH_B     0
 #define MIRROR_SERIAL      0   // GPIO43 is UART TX on this board
+#elif defined(BOARD_ESP32_OLED096)
+// Classic ESP32 (ESP32-D0WD) dev board + 0.96" 128x64 SSD1306 (SDA=21, SCL=22).
+// GPIO6-11 are flash pins on this chip — never use them for LED/buzzer.
+#define BUZZER_PIN         4
+#define USE_BUZZER         1
+#define LED_PIN            2   // onboard LED, active-high
+#define USE_LED            1
+#define LED_ACTIVE_HIGH    1
+#define MIRROR_SERIAL      0   // no GPIO43 on classic ESP32
+#define USE_BUTTON         1   // mark button between GPIO13 and GND
+#define BUTTON_PIN         13
+#elif defined(BOARD_XIAO_ESP32C3_OLED)
+// 01Space-style ESP32-C3 board with 0.42" 72x40 SSD1306 (SDA=5, SCL=6).
+#define BUZZER_PIN         4
+#define USE_BUZZER         1
+#define LED_PIN            8
+#define USE_LED            1
+#define LED_ACTIVE_HIGH    1
+#define MIRROR_SERIAL      0   // no GPIO43 on ESP32-C3
 #else
 // Seeed XIAO ESP32-S3
 #define BUZZER_PIN         3
@@ -31,6 +51,10 @@
 #define LED_ACTIVE_HIGH    0
 #define MIRROR_SERIAL      1
 #define MIRROR_TX_PIN      43
+#endif
+
+#ifndef USE_BUTTON
+#define USE_BUTTON         0
 #endif
 
 #define LED_FLASH_MS       120
@@ -960,6 +984,16 @@ static void emitDetectionJSON(const char* mac, const char* method, uint8_t tier,
       "\"ssid\":\"%s\"}\n",
       method, (unsigned)tier, mac, oui, rssi,
       (unsigned)ch, (unsigned)channelFreqMhz(ch), ssidEsc);
+
+#ifdef USE_BLE_COMPANION
+  // Compact copy for the phone (fits a 247-byte MTU notify).
+  char bleLine[200];
+  int n = snprintf(bleLine, sizeof(bleLine),
+      "{\"event\":\"det\",\"mac\":\"%s\",\"method\":\"wifi_%s\",\"tier\":%u,"
+      "\"rssi\":%d,\"ch\":%u,\"ssid\":\"%s\"}",
+      mac, method, (unsigned)tier, rssi, (unsigned)ch, ssidEsc);
+  if (n > 0 && n < (int)sizeof(bleLine)) bleCompanionNotify(bleLine, n);
+#endif
 }
 
 // ============================================================
@@ -1691,17 +1725,62 @@ static void heartbeatTick() {
 }
 
 // ============================================================
+// MARK BUTTON — press = "I'm looking at a camera right now".
+// Emits a mark event over serial + BLE (the phone geotags it) and
+// gives buzzer/screen feedback. Button wired GPIO -> GND, pullup.
+// ============================================================
+
+#if USE_BUTTON
+static uint32_t markCount = 0;
+
+static void markEvent() {
+  markCount++;
+  char line[96];
+  int n = snprintf(line, sizeof(line),
+                   "{\"event\":\"mark\",\"n\":%lu,\"t\":%lu}",
+                   (unsigned long)markCount, (unsigned long)millis());
+  dualPrintf("%s\n", line);
+  bleCompanionNotify(line, n);
+#if USE_BUZZER
+  tone(BUZZER_PIN, 2400); delay(60); noTone(BUZZER_PIN);
+  delay(40);
+  tone(BUZZER_PIN, 3200); delay(60); noTone(BUZZER_PIN);
+#endif
+  dongleDisplayShowAlert("mark", "saved", 0, currentChannel, 1500);
+}
+
+static void buttonTick() {
+  static bool stable = true;         // true = released (pullup)
+  static bool lastRead = true;
+  static unsigned long lastEdgeAt = 0;
+  bool reading = digitalRead(BUTTON_PIN);
+  unsigned long now = millis();
+  if (reading != lastRead) {
+    lastRead = reading;
+    lastEdgeAt = now;
+  }
+  if (now - lastEdgeAt >= 40 && reading != stable) {
+    stable = reading;
+    if (!stable) markEvent();        // falling edge = press
+  }
+}
+#endif
+
+// ============================================================
 // SETUP / LOOP
 // ============================================================
 
 void setup() {
   Serial.begin(115200);
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
   // Crucial for USB-optional operation: without this, Serial.write() will
   // block indefinitely on an ESP32-S3 USB-CDC port when no host is attached.
+  // (Classic ESP32 uses a hardware UART, which has no such method or problem.)
   Serial.setTxTimeoutMs(0);
+#endif
   delay(300);
 
-#ifdef BOARD_LILYGO_T_DONGLE_S3
+#if defined(BOARD_LILYGO_T_DONGLE_S3) || defined(USE_OLED_DISPLAY)
   dongleDisplayInit();
 #endif
 
@@ -1712,6 +1791,10 @@ void setup() {
 #if USE_BUZZER
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
+#endif
+
+#if USE_BUTTON
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 #endif
 
 #if USE_LED
@@ -1765,6 +1848,8 @@ void setup() {
   esp_wifi_set_promiscuous_rx_cb(&wifiSniffer);
   esp_wifi_set_promiscuous(true);
 
+  bleCompanionInit();  // no-op unless USE_BLE_COMPANION; after WiFi for coex
+
   dualPrintln("[flockyou] merged WiFi detector started");
   dualPrintf("[flockyou] mode=%s dwell_ms=%u start_channel=%u rssi_min=%d spiffs=%d\n",
                 channelModeName(), CHANNEL_DWELL_MS, currentChannel,
@@ -1777,7 +1862,7 @@ void setup() {
   lastHeartbeat = millis();
   fyLastSaveAt  = millis();
 
-#ifdef BOARD_LILYGO_T_DONGLE_S3
+#if defined(BOARD_LILYGO_T_DONGLE_S3) || defined(USE_OLED_DISPLAY)
   dongleDisplayShowIdle(currentChannel, fyDetCount);
 #endif
 }
@@ -1789,6 +1874,9 @@ void loop() {
   autosaveTick();      // periodic SPIFFS write if dirty
   heartbeatTick();     // audible beep-pair while a target is still in range
   ledTick();           // turn off LED after LED_FLASH_MS
+#if USE_BUTTON
+  buttonTick();        // debounced mark button
+#endif
   dongleDisplayTick(millis(), currentChannel, fyDetCount);
   printHeartbeat();
   delay(1);

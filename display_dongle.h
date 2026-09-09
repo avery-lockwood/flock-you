@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 
-#ifdef USE_T_DONGLE_DISPLAY
+#if defined(USE_T_DONGLE_DISPLAY) || defined(USE_OLED_DISPLAY)
 
 void dongleDisplayInit();
 void dongleDisplayShowIdle(uint8_t ch, int detCount);
